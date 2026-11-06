@@ -381,6 +381,168 @@ def apply_merge(store, pair: dict, *, dry_run: bool = True, batch_id: str | None
     return {"ok": True, "keep": keep_id, "retire": retire_id}
 
 
+# ---------------------------------------------------- entity-aware scoring
+# Nomic compresses paraphrases: a correct-but-generic fact sits around 0.51
+# while an unrelated neighbour sits at 0.58, so a cosine floor cannot separate
+# them. Ranking therefore gets a small additive overlap bonus. The bonus never
+# admits a fact (``min_score`` is still checked against the raw cosine) and
+# never outvotes a provider hit; it only reorders facts that are already close.
+ENTITY_BOOST = 0.04       # the query names an entity this fact is about
+ATTRIBUTE_BOOST = 0.02    # the query names an attribute this fact reports
+MAX_ENTITY_BOOST = 0.08   # ceiling on the total additive bonus per fact
+
+# Sentence-initial/question words are not entity names even when capitalised.
+ENTITY_STOP = {
+    "how", "what", "when", "where", "which", "who", "why", "whose",
+    "is", "are", "was", "were", "do", "does", "did", "can", "could",
+    "should", "would", "will", "the", "a", "an", "my", "our", "your",
+    "i", "we", "you", "it", "this", "that", "these", "those",
+    "tell", "show", "give", "list", "find", "get", "please",
+}
+
+# Query attribute -> words that evidence that attribute in a fact. The first
+# entry is the query word itself, so "port" matches "port" literally while
+# "memory" also matches a bare "RAM" claim.
+ATTRIBUTE_ALIASES = {
+    # capacity aliases include the unit words, so "how much memory" reaches a
+    # fact written as "1 GB" even when it never says RAM
+    "memory": ("memory", "ram", "gb", "mb", "tb", "gib"),
+    "ram": ("ram", "memory", "gb", "mb", "tb", "gib"),
+    "storage": ("storage", "disk", "ssd", "nvme", "drive", "gb", "tb"),
+    "disk": ("disk", "storage", "ssd", "nvme"),
+    "cpu": ("cpu", "processor", "cores", "core"),
+    "port": ("port",),
+    "ip": ("ip", "address"),
+    "version": ("version", "release"),
+}
+
+_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*")
+_WORDS_RE = re.compile(r"[a-z0-9]+")
+
+
+def _norm_words(text: str) -> list[str]:
+    return _WORDS_RE.findall((text or "").lower())
+
+
+def _contains_sequence(haystack: list[str], needle: list[str]) -> bool:
+    """True when ``needle`` appears as a contiguous token run in ``haystack``."""
+    n = len(needle)
+    if not n or n > len(haystack):
+        return False
+    return any(haystack[i:i + n] == needle for i in range(len(haystack) - n + 1))
+
+
+def _query_attributes(query: str) -> list[str]:
+    out: list[str] = []
+    for word in _norm_words(query):
+        if word in ATTRIBUTE_ALIASES and word not in out:
+            out.append(word)
+    return out
+
+
+def query_entity_tokens(query: str, known_entities=()) -> list[str]:
+    """Deterministic entity-ish phrases named by ``query``.
+
+    Three cheap sources, no LLM: capitalised runs ("Beacon Mini"), known entity
+    names that appear anywhere in the query even when typed in lower case, and
+    the facts' own ``entities`` column values passed in via ``known_entities``.
+    """
+    text = query or ""
+    out: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if run:
+            out.append(" ".join(run).lower())
+            run.clear()
+
+    for raw in _WORD_RE.findall(text):
+        word = raw.strip("._-")
+        if not word:
+            continue
+        low = word.lower()
+        if (word[0].isupper() and low not in ENTITY_STOP
+                and low not in ATTRIBUTE_ALIASES and not word.isdigit()):
+            run.append(word)
+        else:
+            flush()
+    flush()
+
+    qwords = _norm_words(text)
+    for name in sorted({str(n).strip() for n in known_entities if str(n).strip()}):
+        nwords = _norm_words(name)
+        if not nwords or len("".join(nwords)) < 3:
+            continue
+        if len(nwords) == 1 and (nwords[0] in ENTITY_STOP or nwords[0] in ATTRIBUTE_ALIASES):
+            continue
+        if _contains_sequence(qwords, nwords):
+            out.append(name.lower())
+
+    return list(dict.fromkeys(out))
+
+
+def _entity_cell_names(value) -> list[str]:
+    """Names held in a facts.entities cell: JSON list or comma/semicolon text."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            import json
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [str(item).strip() for item in data if str(item).strip()]
+        except (ValueError, TypeError):
+            pass
+    return [part.strip() for part in re.split(r"[,;|]", text) if part.strip()]
+
+
+def _known_entities(store, rows) -> list[str]:
+    """Entity names known to the store: the facts.entities column plus the table."""
+    names: set[str] = set()
+    for row in rows:
+        names.update(_entity_cell_names(dict(row).get("entities")))
+    try:
+        for row in store.read("SELECT name FROM entities"):
+            name = str(dict(row).get("name") or "").strip()
+            if name:
+                names.add(name)
+    except Exception:  # noqa: BLE001 - the table is optional on older stores
+        pass
+    return sorted(names)
+
+
+def _overlap_boost(entity_phrases, attributes, content: str,
+                   entities: str | None = "") -> float:
+    """The scoring core, with query extraction already done once per request."""
+    if not entity_phrases and not attributes:
+        return 0.0
+
+    haystack = _norm_words(f"{content or ''} {entities or ''}")
+    haywords = set(haystack)
+    boost = 0.0
+    for phrase in entity_phrases:
+        if _contains_sequence(haystack, phrase.split()):
+            boost += ENTITY_BOOST
+    for attribute in attributes:
+        if haywords & set(ATTRIBUTE_ALIASES[attribute]):
+            boost += ATTRIBUTE_BOOST
+    return round(min(boost, MAX_ENTITY_BOOST), 6)
+
+
+def entity_boost(query: str, content: str, entities: str | None = "",
+                 known_entities=()) -> float:
+    """Additive, capped boost for entity + attribute overlap.
+
+    ``ENTITY_BOOST`` is granted once per distinct entity phrase the fact is
+    about, ``ATTRIBUTE_BOOST`` once per distinct attribute word in the query,
+    and the sum never exceeds ``MAX_ENTITY_BOOST``. Facts that match neither
+    get exactly ``0.0``, so their cosine score is untouched.
+    """
+    return _overlap_boost(query_entity_tokens(query, known_entities),
+                          _query_attributes(query), content, entities)
+
+
 # --------------------------------------------------------------- prefetch
 def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
              min_score: float = 0.35, timeout: float = 1.5) -> list[dict] | None:
@@ -406,9 +568,21 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     import math
     import struct
 
-    rows = store.read(
-        "SELECT f.fact_id, f.content, f.trust_score, e.vec FROM fact_embeddings e "
-        "JOIN facts f ON f.fact_id = e.fact_id WHERE e.model = ?", (cfg.embed_model,))
+    try:
+        columns = {str(dict(r).get("name") or "") for r in store.read("PRAGMA table_info(facts)")}
+    except Exception:  # noqa: BLE001 - older stores may not expose PRAGMA
+        columns = set()
+    entity_column = "f.entities" if "entities" in columns else "NULL"
+
+    rows = [dict(r) for r in store.read(
+        "SELECT f.fact_id, f.content, f.trust_score, "
+        f"{entity_column} AS entities, e.vec FROM fact_embeddings e "
+        "JOIN facts f ON f.fact_id = e.fact_id WHERE e.model = ? "
+        "ORDER BY f.fact_id", (cfg.embed_model,))]
+    known_entities = _known_entities(store, rows)
+    entity_phrases = query_entity_tokens(message, known_entities)
+    attributes = _query_attributes(message)
+
     out = []
     for row in rows:
         blob = row["vec"]
@@ -421,11 +595,19 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
         nb = math.sqrt(sum(b * b for b in vec))
         if not na or not nb:
             continue
-        score = dot / (na * nb)
-        if score < min_score or float(row["trust_score"] or 0) < min_trust:
+        cosine = dot / (na * nb)
+        # Admission is unchanged: the raw cosine and trust must clear the gates.
+        # The entity/attribute bonus below only reorders facts that are admitted.
+        if cosine < min_score or float(row["trust_score"] or 0) < min_trust:
             continue
-        out.append({"fact_id": int(row["fact_id"]), "content": row["content"],
-                    "score": round(score, 4), "trust": round(float(row["trust_score"] or 0), 2)})
+        boost = _overlap_boost(entity_phrases, attributes, row["content"],
+                               row.get("entities"))
+        score = cosine + boost
+        hit = {"fact_id": int(row["fact_id"]), "content": row["content"],
+               "score": round(score, 4), "trust": round(float(row["trust_score"] or 0), 2)}
+        if boost:
+            hit["boost"] = round(boost, 4)
+        out.append(hit)
     out.sort(key=lambda r: -r["score"])
     return out[:limit]
 
