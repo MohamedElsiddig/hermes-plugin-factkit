@@ -1,0 +1,6 @@
+embed_base_url: http://127.0.0.1:1234/v1
+embed_api_key: ""
+embed_model: text-embedding-nomic-embed-text-v1.5
+prefetch: true
+limit: 3
+min_score: 0.55

@@ -1,0 +1,10 @@
+name: factkit
+version: 0.1.0
+description: "Semantic recall and maintenance for the holographic memory store — adds an embedding channel and safe review/apply operations on the same database."
+category: memory
+provides_hooks:
+  - pre_llm_call
+  - transform_tool_result
+  - on_session_end
+repository: https://github.com/MohamedElsiddig/hermes-plugin-factkit
+update_url: https://raw.githubusercontent.com/MohamedElsiddig/hermes-plugin-factkit/main/update.yaml
