@@ -551,6 +551,24 @@ def entity_boost(query: str, content: str, entities: str | None = "",
 
 
 # --------------------------------------------------------------- prefetch
+_QUERY_CACHE = None
+
+
+def _query_cache():
+    """Process-wide embedding cache; a cache fault must never break recall."""
+    global _QUERY_CACHE
+    if _QUERY_CACHE is None:
+        import os
+        from .embedcache import EmbedCache
+        path = os.environ.get("FACTKIT_EMBED_CACHE",
+                              str(Path.home() / ".hermes" / "embed_cache.db"))
+        try:
+            _QUERY_CACHE = EmbedCache(path)
+        except Exception:  # noqa: BLE001
+            _QUERY_CACHE = False
+    return _QUERY_CACHE or None
+
+
 def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
              min_score: float = 0.35, timeout: float = 1.5) -> list[dict] | None:
     """Semantic recall for a user message, read from the live store.
@@ -561,12 +579,14 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     """
     from .config import Config
     from .embed import from_config
+    from .embedcache import cached_embed
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
     client = from_config(cfg)
     client.timeout, client.retries = timeout, 0
     try:
-        qvec = client.embed_one(message)
+        qvec = cached_embed(_query_cache(), client.embed_one, message,
+                            str(getattr(cfg, "embed_model", "") or "default"))
     except Exception:  # noqa: BLE001 - endpoint down: caller decides
         return None
     if not qvec:
