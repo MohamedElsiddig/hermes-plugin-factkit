@@ -89,7 +89,14 @@ class ReadOnlyStore:
         return conn
 
     def read(self, sql: str, params=()) -> list[dict]:
-        return [dict(r) for r in self._conn.execute(sql, params)]
+        try:
+            return [dict(r) for r in self._conn.execute(sql, params)]
+        except sqlite3.OperationalError:
+            # opening can succeed and the first read still fail when the WAL
+            # side files are off limits; retry once from a private snapshot
+            self._conn = self._open_snapshot(self.db_path)
+            self._conn.row_factory = sqlite3.Row
+            return [dict(r) for r in self._conn.execute(sql, params)]
 
     def count_facts(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM facts").fetchone()

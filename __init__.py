@@ -292,7 +292,8 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **_kwa
         merged = holo.fuse_results(
             store, query, facts,
             semantic_weight=_num("semantic_weight", 0.5),
-            limit=max(len(facts), 5),
+            # headroom so reserve slots are not starved by a small provider page
+            limit=max(len(facts) + 3, 6),
             timeout=_num("embed_timeout_ms", 1500) / 1000.0)
     except Exception as exc:  # noqa: BLE001
         logger.debug("factkit merge skipped: %s", exc)
