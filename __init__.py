@@ -141,7 +141,15 @@ def _store():
                      ("FACTKIT_EMBED_MODEL", "embed_model")):
         if cfg.get(env) and not os.environ.get(key):
             os.environ[key] = str(cfg[env])
-    return holo.load_plugin_store(_db_path())
+    path = _db_path()
+    try:
+        return holo.load_plugin_store(path)
+    except Exception as exc:  # noqa: BLE001 - the recall path only reads
+        # Opening the provider store takes a write lock; inside the gateway's
+        # plugin host that can fail with a disk I/O error. Degrade to a
+        # read-only connection rather than losing the hook.
+        logger.debug("factkit: write-open failed (%s), using read-only", exc)
+        return holo.ReadOnlyStore(path)
 
 
 def on_pre_llm_call(**kwargs):

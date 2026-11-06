@@ -25,6 +25,28 @@ PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "holographic"
 
 
 # --------------------------------------------------------------------- store
+class ReadOnlyStore:
+    """Read-only view of a store, for callers that cannot take a write lock.
+
+    The gateway may hold the store with restricted write access (plugin host
+    sandbox); the recall path only reads, so it opens the file read-only
+    instead of failing the whole hook.
+    """
+
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(Path(db_path).expanduser())
+        self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True,
+                                     check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+    def read(self, sql: str, params=()) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(sql, params)]
+
+    def count_facts(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM facts").fetchone()
+        return int(row["n"] if row else 0)
+
+
 def load_plugin_store(db_path: str | Path | None = None):
     """Import the holographic plugin's MemoryStore without running its __init__."""
     if "holographic" not in sys.modules:
