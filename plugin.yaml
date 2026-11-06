@@ -1,5 +1,5 @@
 name: factkit
-version: 0.1.2
+version: 0.1.3
 description: "Semantic recall and maintenance for the holographic memory store — adds an embedding channel and safe review/apply operations on the same database."
 category: memory
 provides_hooks:
