@@ -10,7 +10,11 @@ provider — and adds:
   injected twice;
 - re-ranking of `fact_store` search results with the embedding channel
   (`transform_tool_result`);
-- post-session indexing of facts written since the last run (`on_session_end`).
+- post-session indexing of facts written since the last run (`on_session_end`);
+- disk-cached query embeddings (`~/.hermes/embed_cache.db`, 30-day TTL), so warm
+  turns embed once and reuse;
+- read-only store access when the plugin host cannot take a write lock, with a
+  snapshot fallback for WAL side files.
 
 Writes are never automatic. Conflict, duplicate and TTL actions remain explicit
 review/apply operations on the store.
@@ -176,7 +180,7 @@ copy `config.yaml` somewhere else if you want to keep the settings.
 plugin.yaml            manifest (name, version, hooks, repository, update_url)
 __init__.py            plugin entry point: register() + the three hooks
 factkit/holo.py        store access, prefetch, fusion, pending indexing
-factkit/{config,embed,vectors,units,maintenance}.py
+factkit/{config,embed,vectors,units,embedcache,maintenance}.py
 config.example.yaml    settings template (also shipped as config.yaml.example,
                        which Hermes copies to config.yaml on install)
 update.yaml            auto-update feed read by `hermes plugins check-updates`
