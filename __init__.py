@@ -596,6 +596,11 @@ def _dup(content: str, seen: set[str], history_text: str) -> bool:
 def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwargs):
     """Re-rank and merge fact_store search results with the embedding channel.
 
+    The caller's ``limit`` (clamped to 1..50) caps the merged page. Provider
+    rows own the slots they returned, so when the provider fills the page
+    semantic rows no longer displace any; semantic slots appear only when the
+    provider page is shorter than the limit.
+
     Returns None when nothing changes, so the original result stands.
     """
     if not _merge_enabled() or tool_name != "fact_store" or not isinstance(result, str):
@@ -621,6 +626,11 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
     if not facts:
         return None
     try:
+        want = int(args.get("limit") or _num("limit", 3))
+    except (TypeError, ValueError):
+        want = 3
+    want = max(1, min(50, want))
+    try:
         from .factkit import holo
 
         store = _store()
@@ -631,8 +641,7 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
             query,
             facts,
             semantic_weight=_num("semantic_weight", 0.5),
-            # headroom so reserve slots are not starved by a small provider page
-            limit=max(len(facts) + 3, 6),
+            limit=want,
             timeout=_num("embed_timeout_ms", 1500) / 1000.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -646,6 +655,7 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
         return None
     _breaker_reset()
     merged, reranked = _rerank(query, merged)
+    merged = merged[:want]
     _remember((f["content"] for f in merged if f.get("content")), _session_key(kwargs))
     payload[key] = merged
     payload["count"] = len(merged)
