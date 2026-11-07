@@ -1,0 +1,14 @@
+# Files the installer copies into the Hermes plugin root.
+# One path per line, relative to the installed plugin directory.
+# This file is the single source of truth for install.sh and `factkit plugin-status`.
+__init__.py
+plugin.yaml
+manifest.txt
+factkit/config.py
+factkit/embed.py
+factkit/vectors.py
+factkit/units.py
+factkit/embedcache.py
+factkit/rerank.py
+factkit/maintenance.py
+factkit/holo.py
