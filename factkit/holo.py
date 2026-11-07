@@ -39,6 +39,7 @@ class ReadOnlyStore:
 
     def __init__(self, db_path: str | Path):
         self.db_path = str(Path(db_path).expanduser())
+        self._conn: sqlite3.Connection | None = None
         try:
             self._conn = self._open_direct(self.db_path)
         except sqlite3.OperationalError:
@@ -51,30 +52,56 @@ class ReadOnlyStore:
         conn.execute("SELECT COUNT(*) FROM facts").fetchone()   # prove it reads
         return conn
 
+    @staticmethod
+    def _snapshot_key(path: str) -> tuple:
+        """Cache key: main db plus WAL, so uncheckpointed writes invalidate it."""
+        source = Path(path)
+        main = source.stat()
+        key = (str(source), main.st_mtime_ns, main.st_size)
+        wal = source.with_name(source.name + "-wal")
+        try:
+            info = wal.stat()
+            key += (info.st_mtime_ns, info.st_size)
+        except OSError:
+            key += (None, None)
+        return key
+
+    @staticmethod
+    def _backup(source: Path, target: Path) -> None:
+        """Copy the live database with SQLite's backup API, WAL contents included."""
+        src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(str(target))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
     @classmethod
-    def _open_snapshot(cls, path: str) -> sqlite3.Connection:
+    def _open_snapshot(cls, path: str, *, refresh: bool = False) -> sqlite3.Connection:
         import shutil
         import tempfile
         import time
 
         source = Path(path)
-        stamp = (str(source), source.stat().st_mtime_ns, source.stat().st_size)
+        stamp = cls._snapshot_key(path)
+        if refresh:
+            cls._snapshots.pop(stamp, None)
         cached = cls._snapshots.get(stamp)
         if cached:
             return sqlite3.connect(cached, check_same_thread=False)
 
         target_dir = Path(tempfile.mkdtemp(prefix="factkit-ro-"))
         target = target_dir / source.name
-        shutil.copy2(source, target)
-        for suffix in ("-wal", "-shm"):
-            side = source.with_name(source.name + suffix)
-            if side.exists():
-                try:
-                    shutil.copy2(side, target.with_name(target.name + suffix))
-                except OSError:
-                    pass
-        conn = sqlite3.connect(str(target), check_same_thread=False)
-        conn.execute("SELECT COUNT(*) FROM facts").fetchone()
+        try:
+            cls._backup(source, target)
+            conn = sqlite3.connect(str(target), check_same_thread=False)
+            conn.execute("SELECT COUNT(*) FROM facts").fetchone()
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
 
         # keep the cache small; snapshots are per-process and disposable
         for old, _ in list(cls._snapshots.items())[:-2]:
@@ -88,19 +115,31 @@ class ReadOnlyStore:
         cls._snapshots[stamp] = str(target)
         return conn
 
+    def _connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise sqlite3.ProgrammingError("ReadOnlyStore is closed")
+        return self._conn
+
     def read(self, sql: str, params=()) -> list[dict]:
         try:
-            return [dict(r) for r in self._conn.execute(sql, params)]
+            return [dict(r) for r in self._connection().execute(sql, params)]
         except sqlite3.OperationalError:
             # opening can succeed and the first read still fail when the WAL
-            # side files are off limits; retry once from a private snapshot
-            self._conn = self._open_snapshot(self.db_path)
+            # side files are off limits; retry once from a fresh snapshot
+            self.close()
+            self._conn = self._open_snapshot(self.db_path, refresh=True)
             self._conn.row_factory = sqlite3.Row
             return [dict(r) for r in self._conn.execute(sql, params)]
 
     def count_facts(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) AS n FROM facts").fetchone()
+        row = self._connection().execute("SELECT COUNT(*) AS n FROM facts").fetchone()
         return int(row["n"] if row else 0)
+
+    def close(self) -> None:
+        """Close the open connection; safe to call more than once."""
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
 
 
 def load_plugin_store(db_path: str | Path | None = None):
@@ -709,16 +748,25 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
             fact["semantic_score"] = sem_score[fact["fact_id"]]
         by_id[fact["fact_id"]] = fact
 
-    # Reserve part of the result set for facts the provider missed entirely.
-    # Provider misses enter only when they are close to the top of the embedding
-    # channel. A fixed cosine floor misbehaves: nomic puts weak matches at ~0.51,
-    # barely below strong ones, so rank-relative gating is used instead.
+    # Provider rows own the slots: never drop one in favour of a semantic-only
+    # row. With more provider rows than slots, truncate in provider order.
+    if limit and limit < len(provider_facts):
+        return [by_id[fact["fact_id"]] for fact in provider_facts[:limit]]
+
+    # Reserve only the slots the provider channel left empty. A fixed cosine
+    # floor misbehaves: nomic puts weak matches at ~0.51, barely below strong
+    # ones, so rank-relative gating is used instead.
+    if limit:
+        spare = max(0, limit - len(provider_facts))
+        cap = min(max(1, limit // 2), spare)
+    else:
+        cap = 1 if limit in (None, 0) else min(max(1, limit // 2), max(0, limit - len(provider_facts)))
     reserve: list[dict] = []
     cutoff = max(1, min(len(hits), 5))   # top-5 of the embedding channel
     for hit in hits[:cutoff]:
         if hit["fact_id"] in by_id:
             continue
-        if len(reserve) >= max(1, limit // 2):
+        if len(reserve) >= cap:
             break
         score = semantic_weight * _rrf(sem_rank[hit["fact_id"]])
         row = store.read("SELECT fact_id, content, category, tags, trust_score FROM facts "
@@ -732,8 +780,7 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
         reserve.append(fact)
 
     ordered = sorted(by_id.values(), key=lambda f: -f["score"])
-    keep = max(0, limit - len(reserve))
-    return (ordered[:keep] + reserve)[:limit] if limit else ordered + reserve
+    return (ordered + reserve)[:limit] if limit else ordered + reserve
 
 
 

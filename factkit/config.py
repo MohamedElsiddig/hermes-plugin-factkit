@@ -27,6 +27,8 @@ DEFAULTS = {
     "dedupe_threshold": "0.92",
     "rrf_k": "60",
     "review_after_default": "0",
+    "rerank": False,
+    "rerank_min_gain": 0.01,
 }
 
 
@@ -52,6 +54,9 @@ class Config:
     rrf_k: int
     review_after_default: int
     extra: dict = field(default_factory=dict)
+    # Appended with defaults so existing positional construction keeps working.
+    rerank: bool = False
+    rerank_min_gain: float = 0.01
 
     @classmethod
     def load(cls, db_path: str | None = None) -> "Config":
@@ -79,6 +84,8 @@ class Config:
             dedupe_threshold=num("dedupe_threshold", float),
             rrf_k=num("rrf_k", int),
             review_after_default=num("review_after_default", int),
+            rerank=_truthy(_env("rerank")),
+            rerank_min_gain=num("rerank_min_gain", float),
         )
 
 
