@@ -630,6 +630,7 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
     except (TypeError, ValueError):
         want = 3
     want = max(1, min(50, want))
+    want = min(want, len(facts))   # the provider page bounds the page we may return
     try:
         from .factkit import holo
 
