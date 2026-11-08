@@ -531,27 +531,35 @@ def _factkit_vectors_conn(readonly: bool = False):
 def _vectors_conn(store, *, readonly: bool = False):
     """Connection for fact_embeddings: Store's own DB, else factkit's plugin DB.
 
-    A ``factkit.store.Store`` keeps ``fact_embeddings`` in its own file; a
-    read-only provider handle (or any store without a writable ``.db``) uses the
-    factkit plugin DB.
+    Only a ``factkit.store.Store`` keeps ``fact_embeddings`` in its own file.
+    Provider handles (``holo.ReadOnlyStore``, the provider's ``MemoryStore``)
+    always use factkit's plugin DB: provider vectors are copied there once by
+    ``_maybe_migrate_vectors`` instead of being read in place.
     """
-    db = getattr(store, "db", None)
-    if db is not None and not getattr(store, "readonly", False) and hasattr(store, "path"):
-        # factkit.store.Store: vectors live in its own DB
-        try:
-            db.executescript(_FACTKIT_VECTORS_SCHEMA)
-        except Exception:
-            pass
-        return db, False
-    # If the store itself has fact_embeddings (e.g. standalone schema), try it
-    if db is not None:
-        try:
-            db.executescript(_FACTKIT_VECTORS_SCHEMA)
-            return db, False
-        except Exception:
-            pass
+    from .store import Store as FactkitStore
+
+    if isinstance(store, FactkitStore):
+        if not getattr(store, "readonly", False):
+            try:
+                store.db.executescript(_FACTKIT_VECTORS_SCHEMA)
+            except Exception:
+                pass
+        return store.db, False
+
     conn = _factkit_vectors_conn(readonly=readonly)
     return conn, True
+
+
+def _is_provider_store(store) -> bool:
+    """True for the provider's handles (read-only view, standalone, MemoryStore).
+
+    Those must never supply vectors directly: factkit keeps them in its own DB.
+    Unknown duck-typed adapters keep the legacy read-through fallback.
+    """
+    if isinstance(store, (ReadOnlyStore, StandaloneStore)):
+        return True
+    module = getattr(type(store), "__module__", "") or ""
+    return module == "holographic" or module.startswith("holographic.")
 
 def migrate_vectors_from_provider(provider_db_path: str | Path | None = None) -> dict:
     """One-time migration: move vectors from provider's fact_embeddings to factkit's own DB."""
@@ -578,9 +586,22 @@ def migrate_vectors_from_provider(provider_db_path: str | Path | None = None) ->
         except Exception:
             return {"ok": True, "migrated": 0, "reason": "cannot open provider"}
         try:
-            rows = src.execute("SELECT fact_id, model, dims, vec, created_at FROM fact_embeddings").fetchall()
+            cols = {r[1] for r in src.execute("PRAGMA table_info(fact_embeddings)")}
         except Exception:
+            cols = set()
+        if not cols or "fact_id" not in cols or "vec" not in cols:
             rows = []
+        else:
+            model_sql = "model" if "model" in cols else "NULL AS model"
+            dims_sql = "dims" if "dims" in cols else "NULL AS dims"
+            created_sql = "created_at" if "created_at" in cols else "NULL AS created_at"
+            try:
+                rows = src.execute(
+                    f"SELECT fact_id, {model_sql}, {dims_sql}, vec, {created_sql} "
+                    "FROM fact_embeddings"
+                ).fetchall()
+            except Exception:
+                rows = []
         moved = 0
         for r in rows:
             try:
@@ -601,6 +622,69 @@ def migrate_vectors_from_provider(provider_db_path: str | Path | None = None) ->
         except Exception:
             pass
         return {"ok": False, "error": str(exc)}
+
+
+_VECTOR_MIGRATION_ATTEMPTED: set[str] = set()
+
+
+def _factkit_vectors_row_count() -> int:
+    """Rows in factkit's own vectors DB; 0 on any storage fault."""
+    try:
+        conn = _factkit_vectors_conn(readonly=False)
+    except Exception:
+        return 0
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0])
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
+def _maybe_migrate_vectors(store) -> None:
+    """Copy provider vectors into factkit's own DB once, when it is still empty.
+
+    Best effort: a missing provider, an unreadable file or a concurrent writer
+    only logs and leaves recall on the legacy path. Never raises.
+    """
+    from .store import Store as FactkitStore
+
+    if isinstance(store, FactkitStore) or not _is_provider_store(store):
+        return
+    provider = getattr(store, "db_path", None)
+    if not provider:
+        return
+    try:
+        provider_path = Path(provider).expanduser()
+    except Exception:
+        return
+    key = str(provider_path)
+    if key in _VECTOR_MIGRATION_ATTEMPTED:
+        return
+    try:
+        if provider_path.resolve() == _factkit_vectors_db_path().resolve():
+            _VECTOR_MIGRATION_ATTEMPTED.add(key)
+            return
+    except Exception:
+        pass
+    if not provider_path.exists():
+        return
+    if _factkit_vectors_row_count():
+        _VECTOR_MIGRATION_ATTEMPTED.add(key)
+        return
+    try:
+        result = migrate_vectors_from_provider(key)
+    except Exception as exc:  # noqa: BLE001 - migration must never break recall
+        logger.warning("factkit: vector migration from %s failed: %s", key, exc)
+        return
+    if not result.get("ok"):
+        logger.warning("factkit: vector migration from %s failed: %s",
+                       key, result.get("error") or result.get("reason"))
+        return
+    _VECTOR_MIGRATION_ATTEMPTED.add(key)
+    if result.get("migrated"):
+        logger.info("factkit: migrated %s vectors from provider DB %s",
+                    result["migrated"], key)
 
 
 def _ro_conn(path: str | Path):
@@ -1068,10 +1152,7 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     from .embed import from_config
     from .embedcache import cached_embed
 
-    try:
-        migrate_vectors_from_provider(getattr(store, "db_path", None))
-    except Exception:
-        pass
+    _maybe_migrate_vectors(store)
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
     client = from_config(cfg)
@@ -1110,18 +1191,19 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     except Exception:
         vec_rows = {}
 
-    # Also try to read from store for backward compatibility
-    try:
-        sread = getattr(store, "read", None)
-        if sread:
-            for r in sread(
-                    "SELECT fact_id, vec FROM fact_embeddings WHERE model = ?",
-                    (model,)):
-                d = dict(r) if not isinstance(r, dict) else r
-                if int(d["fact_id"]) not in vec_rows:
+    # Legacy duck-typed adapters still work; provider handles must read only
+    # factkit's own DB so recall never silently depends on provider storage.
+    if not vec_rows and not _is_provider_store(store):
+        try:
+            sread = getattr(store, "read", None)
+            if sread:
+                for r in sread(
+                        "SELECT fact_id, vec FROM fact_embeddings WHERE model = ?",
+                        (model,)):
+                    d = dict(r) if not isinstance(r, dict) else r
                     vec_rows[int(d["fact_id"])] = d
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     if not vec_rows:
         return []
@@ -1183,10 +1265,7 @@ def index_pending(store, *, batch: int = 32, force: bool = False) -> dict:
     from .embed import from_config
     from .vectors import pack
 
-    try:
-        migrate_vectors_from_provider(getattr(store, "db_path", None))
-    except Exception:
-        pass
+    _maybe_migrate_vectors(store)
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
     client = from_config(cfg)
@@ -1202,14 +1281,16 @@ def index_pending(store, *, batch: int = 32, force: bool = False) -> dict:
                 vconn.close()
     except Exception:
         pass
-    # Also check store for backward compat
-    try:
-        sread = getattr(store, "read", None)
-        if sread:
-            for r in sread("SELECT fact_id FROM fact_embeddings WHERE model = ?", (model,)):
-                have.add(int(dict(r)["fact_id"] if not isinstance(r, dict) else r["fact_id"]))
-    except Exception:
-        pass
+    # Legacy adapters only: provider handles must count factkit's own rows so
+    # migration + indexing converge instead of treating provider rows as done.
+    if not _is_provider_store(store):
+        try:
+            sread = getattr(store, "read", None)
+            if sread:
+                for r in sread("SELECT fact_id FROM fact_embeddings WHERE model = ?", (model,)):
+                    have.add(int(dict(r)["fact_id"] if not isinstance(r, dict) else r["fact_id"]))
+        except Exception:
+            pass
     try:
         sread = getattr(store, "read", None)
         if sread:
