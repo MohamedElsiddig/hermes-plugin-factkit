@@ -11,7 +11,7 @@ did in the ``audit`` table, written by factkit with actor ``factkit``.
 
 from __future__ import annotations
 
-import importlib.util
+import contextlib
 import logging
 import re
 import sqlite3
@@ -21,7 +21,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "holographic"
+try:
+    from hermes_constants import get_hermes_home  # type: ignore
+    _HERMES_HOME = get_hermes_home()
+except Exception:  # pragma: no cover - outside Hermes
+    _HERMES_HOME = Path.home() / ".hermes"
+
+PLUGIN_DIR = _HERMES_HOME / "plugins" / "holographic"
 
 
 # --------------------------------------------------------------------- store
@@ -142,27 +148,459 @@ class ReadOnlyStore:
             conn.close()
 
 
-def load_plugin_store(db_path: str | Path | None = None):
-    """Import the holographic plugin's MemoryStore without running its __init__."""
-    if "holographic" not in sys.modules:
-        pkg = types.ModuleType("holographic")
-        pkg.__path__ = [str(PLUGIN_DIR)]
-        sys.modules["holographic"] = pkg
-    try:  # gateway: the real runtime helpers are importable
-        import hermes_state_wal  # noqa: F401
-    except ImportError:  # CLI: install stand-ins before the provider loads
-        try:
-            from . import standalone
-        except ImportError:
-            raise ImportError(
-                "holographic provider needs the Hermes runtime; run this from the "
-                "gateway or from the factkit CLI"
-            )
-        standalone.ensure()
-    from holographic.store import MemoryStore  # noqa: WPS433 - deliberate late import
+# Provider-compatible schema subset for the standalone store. It deliberately
+# omits the maintenance tables (tombstones, audit, proposals): those are created
+# on demand by ``factkit.maintenance.ensure_tombstones``.
+_STORE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS facts (
+    fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    content         TEXT NOT NULL UNIQUE,
+    category        TEXT DEFAULT 'general',
+    tags            TEXT DEFAULT '',
+    trust_score     REAL DEFAULT 0.5,
+    retrieval_count INTEGER DEFAULT 0,
+    helpful_count   INTEGER DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    hrr_vector      BLOB
+);
 
-    path = str(Path(db_path).expanduser()) if db_path else str(Path.home() / ".hermes" / "memory_store.db")
-    return MemoryStore(path)
+CREATE TABLE IF NOT EXISTS entities (
+    entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    entity_type TEXT DEFAULT 'unknown',
+    aliases     TEXT DEFAULT '',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fact_entities (
+    fact_id   INTEGER REFERENCES facts(fact_id),
+    entity_id INTEGER REFERENCES entities(entity_id),
+    PRIMARY KEY (fact_id, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_trust    ON facts(trust_score DESC);
+CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
+CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
+    USING fts5(content, tags, content=facts, content_rowid=fact_id);
+
+CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+    INSERT INTO facts_fts(rowid, content, tags)
+        VALUES (new.fact_id, new.content, new.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, content, tags)
+        VALUES ('delete', old.fact_id, old.content, old.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF content, tags ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, content, tags)
+        VALUES ('delete', old.fact_id, old.content, old.tags);
+    INSERT INTO facts_fts(rowid, content, tags)
+        VALUES (new.fact_id, new.content, new.tags);
+END;
+
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+class StandaloneStore:
+    """Writable store used when the holographic provider is not installed.
+
+    Implements the subset of the provider's ``MemoryStore`` contract that
+    factkit's maintenance and CLI paths use, on the same schema shape
+    (AUTOINCREMENT fact ids, external-content FTS, entity tables). It is
+    stdlib-only: nothing here imports the provider.
+    """
+
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(Path(db_path).expanduser())
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:  # pragma: no cover - filesystem without WAL
+            pass
+        conn.executescript(_STORE_SCHEMA)
+        self._conn: sqlite3.Connection | None = conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        return self._connection()
+
+    def _connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise sqlite3.ProgrammingError("StandaloneStore is closed")
+        return self._conn
+
+    def read(self, sql: str, params=()) -> list:
+        return self._connection().execute(sql, params).fetchall()
+
+    def _one(self, sql: str, params=()):
+        return self._connection().execute(sql, params).fetchone()
+
+    def _write(self, sql: str, params=()) -> sqlite3.Cursor:
+        """One write statement: autocommitted on its own, or part of an enclosing _tx()."""
+        return self._connection().execute(sql, params)
+
+    @contextlib.contextmanager
+    def _tx(self):
+        """One write transaction; nested calls join the outer one."""
+        conn = self._connection()
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+
+    def count_facts(self) -> int:
+        row = self._connection().execute("SELECT COUNT(*) FROM facts").fetchone()
+        return int(row[0]) if row else 0
+
+    def _entity(self, name: str, entity_type: str) -> int:
+        row = self._connection().execute(
+            "SELECT entity_id FROM entities WHERE name = ?", (name,)).fetchone()
+        if row is not None:
+            if entity_type == "declared":
+                self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ?",
+                            (row[0],))
+            return int(row[0])
+        cur = self._write("INSERT INTO entities(name, entity_type) VALUES (?, ?)",
+                          (name, entity_type))
+        return int(cur.lastrowid)
+
+    def _link(self, fact_id: int, content: str, declared=()) -> None:
+        """Link declared names, else conservative multi-word extracted candidates."""
+        names = [(str(name).strip(), "declared") for name in declared or ()
+                 if isinstance(name, str) and str(name).strip()]
+        if not names:
+            try:
+                from . import entities as entmod
+                names = [(name, "extracted") for name in entmod.candidates(content)
+                         if len(str(name).split()) > 1]
+            except Exception:  # noqa: BLE001 - extraction is optional
+                names = []
+        for name, entity_type in names:
+            entity_id = self._entity(name, entity_type)
+            self._write("INSERT OR IGNORE INTO fact_entities(fact_id, entity_id) VALUES (?,?)",
+                        (fact_id, entity_id))
+
+    def add_fact_status(self, content: str, category: str = "general", tags: str = "", *,
+                        trust: float | None = None, entities=()) -> tuple[int, bool]:
+        """(fact_id, created); duplicate content reuses the existing row."""
+        content = (content or "").strip()
+        if not content:
+            raise ValueError("content must not be empty")
+        with self._tx():
+            try:
+                cur = self._write(
+                    "INSERT INTO facts(content, category, tags, trust_score) VALUES (?,?,?,?)",
+                    (content, category, tags, 0.5 if trust is None else trust))
+                fact_id = int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                return int(self._one("SELECT fact_id FROM facts WHERE content = ?",
+                                     (content,))["fact_id"]), False
+            self._link(fact_id, content, entities)
+            return fact_id, True
+
+    def replace_fact(self, old_id: int, content: str, category: str = "general", tags: str = "",
+                     *, entities=()) -> tuple[int, bool]:
+        """Supersede a fact in one transaction; KeyError when it does not exist."""
+        with self._tx():
+            old = self._one("SELECT fact_id, content FROM facts WHERE fact_id = ?", (old_id,))
+            if old is None:
+                raise KeyError(f"fact_id {old_id} not found")
+            if old["content"] == (content or "").strip():
+                return int(old_id), False
+            fact_id, created = self.add_fact_status(
+                content, category=category, tags=tags, entities=entities)
+            self.remove_fact(old_id)
+            return fact_id, created
+
+    def update_fact(self, fact_id: int, content: str | None = None,
+                    trust_delta: float | None = None, tags: str | None = None,
+                    category: str | None = None, *, entities=(), touch: bool = True) -> bool:
+        """Partially update a fact; returns True when the row existed."""
+        if content is not None:
+            content = content.strip()
+            if not content:
+                raise ValueError("content must not be empty")
+        with self._tx():
+            row = self._one("SELECT fact_id, trust_score, category FROM facts WHERE fact_id = ?",
+                            (fact_id,))
+            if row is None:
+                return False
+            changes = {col: val for col, val in {
+                "content": content, "tags": tags, "category": category,
+                "trust_score": (min(1.0, max(0.0, float(row["trust_score"] or 0.0) + trust_delta))
+                                if trust_delta is not None else None),
+            }.items() if val is not None}
+            assignments = ", ".join((["updated_at = CURRENT_TIMESTAMP"] if touch else [])
+                                    + [f"{col} = ?" for col in changes])
+            if not assignments:
+                return True
+            try:
+                self._write(f"UPDATE facts SET {assignments} WHERE fact_id = ?",
+                            [*changes.values(), fact_id])
+            except sqlite3.IntegrityError:
+                other = self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))
+                owner = other["fact_id"] if other else "?"
+                raise ValueError(f"content already belongs to fact {owner}") from None
+            if content is not None:
+                kept = [r[0] for r in self._connection().execute(
+                    "SELECT e.name FROM fact_entities fe JOIN entities e "
+                    "ON e.entity_id = fe.entity_id "
+                    "WHERE fe.fact_id = ? AND e.entity_type = 'declared'", (fact_id,))]
+                self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
+                self._link(fact_id, content, [*kept, *(entities or ())])
+            elif entities:
+                self._link(fact_id, "", entities)
+            return True
+
+    def remove_fact(self, fact_id: int) -> bool:
+        """Delete a fact and its entity links; returns True when the row existed."""
+        with self._tx():
+            row = self._one("SELECT fact_id FROM facts WHERE fact_id = ?", (fact_id,))
+            if row is None:
+                return False
+            self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
+            self._write("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
+            return True
+
+    def close(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
+
+
+def _provider_db_path(db_path: str | Path | None = None) -> str:
+    """Path of the provider's live store (or the explicit path the caller gave)."""
+    if db_path:
+        return str(Path(db_path).expanduser())
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return str(get_hermes_home() / "memory_store.db")
+    except Exception:  # pragma: no cover - outside Hermes
+        return str(_HERMES_HOME / "memory_store.db")
+
+
+def _factkit_db_path() -> Path:
+    """factkit's own writable database, used when no provider is installed."""
+    p = _HERMES_HOME / "plugins" / "factkit" / "facts.db"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _ensure_store_file(p: Path) -> "StandaloneStore":
+    """Create the database with a usable schema, not a bare 0-byte file."""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return StandaloneStore(str(p))
+
+
+def load_plugin_store(db_path: str | Path | None = None):
+    """Return a read-only handle to the provider store.
+
+    Never imports the provider and never raises at import time: a missing file
+    is bootstrapped with the provider-compatible schema so the read-only probe
+    has a ``facts`` table to read.
+    """
+    path = _provider_db_path(db_path)
+    p = Path(path)
+    if not p.exists():
+        _ensure_store_file(p).close()
+    return ReadOnlyStore(path)
+
+
+def _provider_memory_store():
+    """The provider's writable ``MemoryStore`` class, or None when unavailable.
+
+    This is the only place allowed to register ``holographic`` in
+    ``sys.modules``; the read-only path never does.
+    """
+    # 1) direct import (Hermes gateway)
+    try:
+        from holographic.store import MemoryStore  # type: ignore
+        return MemoryStore
+    except Exception:
+        pass
+    # 2) CLI with the provider plugin installed but not on sys.path
+    try:
+        if "holographic" not in sys.modules and (PLUGIN_DIR / "store.py").exists():
+            pkg = types.ModuleType("holographic")
+            pkg.__path__ = [str(PLUGIN_DIR)]
+            pkg.__package__ = "holographic"
+            sys.modules["holographic"] = pkg
+            try:
+                from . import standalone  # type: ignore
+                standalone.ensure()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        from holographic.store import MemoryStore  # type: ignore
+        return MemoryStore
+    except Exception:
+        return None
+
+
+def get_memory_store(db_path: str | Path | None = None):
+    """Get a writable store: the provider's when installed, else a standalone one."""
+    path = _provider_db_path(db_path)
+    cls = _provider_memory_store()
+    if cls is not None:
+        return cls(path)
+    if db_path is None:
+        path = str(_factkit_db_path())
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return StandaloneStore(path)
+
+
+_FACTKIT_VECTORS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+    fact_id INTEGER,
+    model TEXT,
+    dims INTEGER,
+    vec BLOB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (fact_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_factkit_emb_model ON fact_embeddings(model);
+"""
+
+
+def _factkit_vectors_db_path() -> Path:
+    try:
+        from plugins import plugin_storage  # type: ignore
+        try:
+            conn = plugin_storage.plugin_db("factkit")
+            dbp = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+            conn.close()
+            if dbp and str(dbp) != ":memory:":
+                return dbp
+        except Exception:
+            pass
+        try:
+            return plugin_storage.plugin_data_dir("factkit") / "facts.db"
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        base = get_hermes_home() / "plugins" / "factkit"
+    except Exception:
+        base = Path.home() / ".hermes" / "plugins" / "factkit"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "facts.db"
+
+
+def _factkit_vectors_conn(readonly: bool = False):
+    dbp = _factkit_vectors_db_path()
+    if readonly:
+        try:
+            conn = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True, check_same_thread=False)
+        except Exception:
+            dbp.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(dbp), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executescript(_FACTKIT_VECTORS_SCHEMA)
+            conn.close()
+            conn = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True, check_same_thread=False)
+    else:
+        conn = sqlite3.connect(str(dbp), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executescript(_FACTKIT_VECTORS_SCHEMA)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+
+
+def _vectors_conn(store, *, readonly: bool = False):
+    """Connection for fact_embeddings: Store's own DB, else factkit's plugin DB.
+
+    A ``factkit.store.Store`` keeps ``fact_embeddings`` in its own file; a
+    read-only provider handle (or any store without a writable ``.db``) uses the
+    factkit plugin DB.
+    """
+    db = getattr(store, "db", None)
+    if db is not None and not getattr(store, "readonly", False) and hasattr(store, "path"):
+        # factkit.store.Store: vectors live in its own DB
+        try:
+            db.executescript(_FACTKIT_VECTORS_SCHEMA)
+        except Exception:
+            pass
+        return db, False
+    # If the store itself has fact_embeddings (e.g. standalone schema), try it
+    if db is not None:
+        try:
+            db.executescript(_FACTKIT_VECTORS_SCHEMA)
+            return db, False
+        except Exception:
+            pass
+    conn = _factkit_vectors_conn(readonly=readonly)
+    return conn, True
+
+def migrate_vectors_from_provider(provider_db_path: str | Path | None = None) -> dict:
+    """One-time migration: move vectors from provider's fact_embeddings to factkit's own DB."""
+    try:
+        target = _factkit_vectors_conn(readonly=False)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        # Find provider DB
+        provider_path = None
+        if provider_db_path:
+            provider_path = Path(provider_db_path).expanduser()
+        else:
+            try:
+                from hermes_constants import get_hermes_home  # type: ignore
+                provider_path = get_hermes_home() / "memory_store.db"
+            except Exception:
+                provider_path = Path.home() / ".hermes" / "memory_store.db"
+        if not provider_path.exists():
+            return {"ok": True, "migrated": 0, "reason": "no provider db"}
+        try:
+            src = sqlite3.connect(f"file:{provider_path}?mode=ro", uri=True)
+            src.row_factory = sqlite3.Row
+        except Exception:
+            return {"ok": True, "migrated": 0, "reason": "cannot open provider"}
+        try:
+            rows = src.execute("SELECT fact_id, model, dims, vec, created_at FROM fact_embeddings").fetchall()
+        except Exception:
+            rows = []
+        moved = 0
+        for r in rows:
+            try:
+                target.execute(
+                    "INSERT OR REPLACE INTO fact_embeddings(fact_id, model, dims, vec, created_at) VALUES (?,?,?,?,?)",
+                    (r["fact_id"], r["model"], r["dims"], r["vec"], r["created_at"]),
+                )
+                moved += 1
+            except Exception:
+                continue
+        target.commit()
+        target.close()
+        src.close()
+        return {"ok": True, "migrated": moved}
+    except Exception as exc:
+        try:
+            target.close()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(exc)}
 
 
 def _ro_conn(path: str | Path):
@@ -275,10 +713,17 @@ def find_conflicts(db_path: str | Path, overlap_min: float = 0.35,
         facts = [dict(r) for r in conn.execute(
             "SELECT fact_id, content, category, trust_score, created_at, updated_at FROM facts")]
         links: dict[int, set[str]] = {}
-        for r in conn.execute(
+        try:
+            erows = conn.execute(
                 "SELECT fe.fact_id, e.name FROM fact_entities fe "
                 "JOIN entities e ON e.entity_id = fe.entity_id "
-                "WHERE e.entity_type = 'declared'"):
+                "WHERE e.entity_type = 'declared'").fetchall()
+        except sqlite3.OperationalError:
+            erows = conn.execute(
+                "SELECT fe.fact_id, e.name FROM fact_entities fe "
+                "JOIN entities e ON e.entity_id = fe.entity_id "
+                "WHERE e.kind = 'declared'").fetchall()
+        for r in erows:
             links.setdefault(int(r["fact_id"]), set()).add(r["name"].lower())
     finally:
         conn.close()
@@ -599,8 +1044,13 @@ def _query_cache():
     if _QUERY_CACHE is None:
         import os
         from .embedcache import EmbedCache
-        path = os.environ.get("FACTKIT_EMBED_CACHE",
-                              str(Path.home() / ".hermes" / "embed_cache.db"))
+        default_cache = None
+        try:
+            from hermes_constants import get_hermes_home  # type: ignore
+            default_cache = str(get_hermes_home() / "embed_cache.db")
+        except Exception:
+            default_cache = str(Path.home() / ".hermes" / "embed_cache.db")
+        path = os.environ.get("FACTKIT_EMBED_CACHE", default_cache)
         try:
             _QUERY_CACHE = EmbedCache(path)
         except Exception:  # noqa: BLE001
@@ -610,15 +1060,18 @@ def _query_cache():
 
 def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
              min_score: float = 0.35, timeout: float = 1.5) -> list[dict] | None:
-    """Semantic recall for a user message, read from the live store.
+    """Semantic recall for a user message.
 
-    Uses the embeddings in ``fact_embeddings`` and the configured embedding
-    endpoint. Returns ``None`` when the endpoint is unavailable (so a caller can
-    trip a circuit breaker) and ``[]`` when nothing scores above the threshold.
+    Reads facts from the read-only provider store and vectors from factkit's own DB.
     """
     from .config import Config
     from .embed import from_config
     from .embedcache import cached_embed
+
+    try:
+        migrate_vectors_from_provider(getattr(store, "db_path", None))
+    except Exception:
+        pass
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
     client = from_config(cfg)
@@ -640,20 +1093,68 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
         columns = set()
     entity_column = "f.entities" if "entities" in columns else "NULL"
 
-    rows = [dict(r) for r in store.read(
-        "SELECT f.fact_id, f.content, f.trust_score, "
-        f"{entity_column} AS entities, e.vec FROM fact_embeddings e "
-        "JOIN facts f ON f.fact_id = e.fact_id WHERE e.model = ? "
-        "ORDER BY f.fact_id", (cfg.embed_model,))]
+    model = getattr(cfg, "embed_model", None)
+    # Get vectors from factkit's own DB (or the store's own DB for Store)
+    vec_rows = {}
+    try:
+        vconn, vclose = _vectors_conn(store, readonly=True)
+        try:
+            for r in vconn.execute(
+                    "SELECT fact_id, model, dims, vec FROM fact_embeddings WHERE model = ?",
+                    (model,)):
+                d = dict(r) if not isinstance(r, dict) else r
+                vec_rows[int(d["fact_id"])] = d
+        finally:
+            if vclose:
+                vconn.close()
+    except Exception:
+        vec_rows = {}
+
+    # Also try to read from store for backward compatibility
+    try:
+        sread = getattr(store, "read", None)
+        if sread:
+            for r in sread(
+                    "SELECT fact_id, vec FROM fact_embeddings WHERE model = ?",
+                    (model,)):
+                d = dict(r) if not isinstance(r, dict) else r
+                if int(d["fact_id"]) not in vec_rows:
+                    vec_rows[int(d["fact_id"])] = d
+    except Exception:
+        pass
+
+    if not vec_rows:
+        return []
+
+    fact_ids = list(vec_rows.keys())
+    # Read facts from provider store
+    try:
+        placeholders = ",".join("?" for _ in fact_ids)
+        rows = [dict(r) for r in store.read(
+            f"SELECT f.fact_id, f.content, f.trust_score, {entity_column} AS entities "
+            f"FROM facts f WHERE f.fact_id IN ({placeholders})",
+            tuple(fact_ids))]
+    except Exception:
+        return []
+
+    by_id = {int(r["fact_id"]): r for r in rows}
     known_entities = _known_entities(store, rows)
     entity_phrases = query_entity_tokens(message, known_entities)
     attributes = _query_attributes(message)
 
     out = []
-    for row in rows:
-        blob = row["vec"]
-        n = len(blob) // 4
-        vec = struct.unpack(f"<{n}f", blob)
+    for fid, frow in by_id.items():
+        vrow = vec_rows.get(fid)
+        if not vrow:
+            continue
+        blob = vrow["vec"]
+        if blob is None:
+            continue
+        try:
+            n = len(blob) // 4
+            vec = struct.unpack(f"<{n}f", blob)
+        except Exception:
+            continue
         if len(vec) != len(qvec):
             continue
         dot = sum(a * b for a, b in zip(qvec, vec))
@@ -662,15 +1163,13 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
         if not na or not nb:
             continue
         cosine = dot / (na * nb)
-        # Admission is unchanged: the raw cosine and trust must clear the gates.
-        # The entity/attribute bonus below only reorders facts that are admitted.
-        if cosine < min_score or float(row["trust_score"] or 0) < min_trust:
+        if cosine < min_score or float(frow.get("trust_score") or 0) < min_trust:
             continue
-        boost = _overlap_boost(entity_phrases, attributes, row["content"],
-                               row.get("entities"))
+        boost = _overlap_boost(entity_phrases, attributes, frow["content"],
+                               frow.get("entities"))
         score = cosine + boost
-        hit = {"fact_id": int(row["fact_id"]), "content": row["content"],
-               "score": round(score, 4), "trust": round(float(row["trust_score"] or 0), 2)}
+        hit = {"fact_id": int(fid), "content": frow["content"],
+               "score": round(score, 4), "trust": round(float(frow.get("trust_score") or 0), 2)}
         if boost:
             hit["boost"] = round(boost, 4)
         out.append(hit)
@@ -679,38 +1178,72 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
 
 
 def index_pending(store, *, batch: int = 32, force: bool = False) -> dict:
-    """Embed facts that have no vector for the configured model."""
+    """Embed facts that have no vector for the configured model (writes to factkit's own DB)."""
     from .config import Config
     from .embed import from_config
     from .vectors import pack
 
+    try:
+        migrate_vectors_from_provider(getattr(store, "db_path", None))
+    except Exception:
+        pass
+
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
     client = from_config(cfg)
     model = cfg.embed_model
-    have = {int(r["fact_id"]) for r in store.read(
-        "SELECT fact_id FROM fact_embeddings WHERE model = ?", (model,))}
-    rows = [dict(r) for r in store.read("SELECT fact_id, content FROM facts ORDER BY fact_id")]
+    have = set()
+    try:
+        vconn, vclose = _vectors_conn(store, readonly=False)
+        try:
+            for r in vconn.execute("SELECT fact_id FROM fact_embeddings WHERE model = ?", (model,)):
+                have.add(int(r["fact_id"] if not isinstance(r, dict) else r["fact_id"]))
+        finally:
+            if vclose:
+                vconn.close()
+    except Exception:
+        pass
+    # Also check store for backward compat
+    try:
+        sread = getattr(store, "read", None)
+        if sread:
+            for r in sread("SELECT fact_id FROM fact_embeddings WHERE model = ?", (model,)):
+                have.add(int(dict(r)["fact_id"] if not isinstance(r, dict) else r["fact_id"]))
+    except Exception:
+        pass
+    try:
+        sread = getattr(store, "read", None)
+        if sread:
+            rows = [dict(r) for r in sread("SELECT fact_id, content FROM facts ORDER BY fact_id")]
+        else:
+            rows = [dict(r) for r in store.db.execute("SELECT fact_id, content FROM facts ORDER BY fact_id")]
+    except Exception:
+        rows = []
     todo = [r for r in rows if force or int(r["fact_id"]) not in have]
     if not todo:
         return {"model": model, "indexed": 0, "pending": 0}
 
     done = 0
     try:
-        for i in range(0, len(todo), batch):
-            chunk = todo[i:i + batch]
-            vecs = client.embed([r["content"] for r in chunk])
-            if not vecs:
-                break
-            conn = sqlite3.connect(store.db_path, timeout=10.0)
-            try:
+        vconn, vclose = _vectors_conn(store, readonly=False)
+        try:
+            for i in range(0, len(todo), batch):
+                chunk = todo[i:i + batch]
+                vecs = client.embed([r["content"] for r in chunk])
+                if not vecs:
+                    break
                 for row, vec in zip(chunk, vecs):
-                    conn.execute(
+                    vconn.execute(
                         "INSERT OR REPLACE INTO fact_embeddings(fact_id, model, dims, vec) "
                         "VALUES (?,?,?,?)", (row["fact_id"], model, len(vec), pack(vec)))
-                conn.commit()
-            finally:
-                conn.close()
-            done += len(chunk)
+                if vclose:
+                    vconn.commit()
+                else:
+                    try: vconn.commit()
+                    except Exception: pass
+                done += len(chunk)
+        finally:
+            if vclose:
+                vconn.close()
     except Exception as exc:  # noqa: BLE001 - endpoint down: report, do not raise
         return {"model": model, "indexed": done, "pending": len(todo) - done, "error": str(exc)}
     return {"model": model, "indexed": done, "pending": len(todo) - done}

@@ -37,6 +37,31 @@ logger = logging.getLogger(__name__)
 
 _CFG = {}
 
+# Plugin configuration schema
+config_schema = [
+    {
+        "key": "embed_api_key",
+        "secret": True,
+        "requires_env": "FACTKIT_EMBED_API_KEY",
+        "description": "API key for the embedding endpoint",
+    },
+    {
+        "key": "embed_base_url",
+        "description": "Embedding endpoint base URL",
+        "env_var": "FACTKIT_EMBED_BASE_URL",
+    },
+    {
+        "key": "embed_model",
+        "description": "Embedding model name",
+        "env_var": "FACTKIT_EMBED_MODEL",
+    },
+    {
+        "key": "db",
+        "description": "Path to the holographic memory store database",
+        "env_var": "FACTKIT_DB",
+    },
+]
+
 
 def _config() -> dict:
     """Plugin config: config.yaml next to this file, env overrides."""
@@ -44,14 +69,14 @@ def _config() -> dict:
     if _CFG:
         return _CFG
     data = {}
-    path = Path(__file__).with_name("config.yaml")
-    if path.exists():
+    cfg_path = Path(__file__).with_name("config.yaml")
+    if cfg_path.exists():
         try:
             import yaml
 
-            data = yaml.safe_load(path.read_text()) or {}
+            data = yaml.safe_load(cfg_path.read_text()) or {}
         except ImportError:  # no PyYAML: parse the flat key: value subset we use
-            for line in path.read_text().splitlines():
+            for line in cfg_path.read_text().splitlines():
                 line = line.split("#", 1)[0].strip()
                 if not line or ":" not in line:
                     continue
@@ -68,18 +93,40 @@ def _config() -> dict:
             logger.warning("factkit: bad config.yaml (%s)", exc)
     for key, env in (
         ("embed_base_url", "FACTKIT_EMBED_BASE_URL"),
-        ("embed_api_key", "FACTKIT_EMBED_API_KEY"),
         ("embed_model", "FACTKIT_EMBED_MODEL"),
         ("db", "FACTKIT_DB"),
     ):
         if os.environ.get(env):
             data[key] = os.environ[env]
+    # Read API key via secret scope (never write to os.environ)
+    try:
+        from agent import secret_scope  # type: ignore
+
+        secret = None
+        try:
+            secret = secret_scope.get_secret("FACTKIT_EMBED_API_KEY")
+        except Exception:
+            try:
+                secret = secret_scope.get_secret("embed_api_key")
+            except Exception:
+                secret = None
+        if secret:
+            data["embed_api_key"] = secret
+        elif os.environ.get("FACTKIT_EMBED_API_KEY"):
+            data["embed_api_key"] = os.environ["FACTKIT_EMBED_API_KEY"]
+    except Exception:
+        if os.environ.get("FACTKIT_EMBED_API_KEY"):
+            data["embed_api_key"] = os.environ["FACTKIT_EMBED_API_KEY"]
     _CFG = data
     return data
 
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_DB = os.path.expanduser("~/.hermes/memory_store.db")
+try:
+    from hermes_constants import get_hermes_home  # type: ignore
+    _DEFAULT_DB = str(get_hermes_home() / "memory_store.db")
+except Exception:  # pragma: no cover - outside Hermes
+    _DEFAULT_DB = os.path.expanduser(os.path.join("~", ".hermes", "memory_store.db"))
 
 
 def _db_path() -> str:
@@ -187,30 +234,10 @@ def health() -> dict:
     return h
 
 
-def _apply_embed_env() -> None:
-    """Copy embed config into the environment once, at import.
 
-    holo builds its embedding client from ``Config.load()``, which reads only
-    ``FACTKIT_*`` variables and takes no config argument. Applying the file's
-    values here (and never overriding what the host already set) keeps every
-    hook consistent without mutating ``os.environ`` per call. ``FACTKIT_DB`` is
-    deliberately never set: the store path is always passed explicitly.
-    """
-    cfg = _config()
-    for key, env in (
-        ("embed_base_url", "FACTKIT_EMBED_BASE_URL"),
-        ("embed_api_key", "FACTKIT_EMBED_API_KEY"),
-        ("embed_model", "FACTKIT_EMBED_MODEL"),
-    ):
-        if cfg.get(key) and not os.environ.get(env):
-            os.environ[env] = str(cfg[key])
-    if not os.environ.get("FACTKIT_EMBED_TIMEOUT"):
-        timeout = _num("embed_timeout_ms", 1500.0) / 1000.0
-        if timeout > 0:
-            os.environ["FACTKIT_EMBED_TIMEOUT"] = f"{timeout:g}"
+# Embedding configuration is read via _config() and passed explicitly;
+# no environment mutation.
 
-
-_apply_embed_env()
 
 
 def _merge_enabled() -> bool:

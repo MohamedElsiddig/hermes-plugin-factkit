@@ -1,5 +1,5 @@
 name: factkit
-version: 0.2.1
+version: 0.3.0
 description: "Semantic recall and maintenance for the holographic memory store — adds an embedding channel and safe review/apply operations on the same database."
 category: memory
 provides_hooks:
@@ -9,3 +9,40 @@ provides_hooks:
 repository: https://github.com/MohamedElsiddig/hermes-plugin-factkit
 update_url: https://raw.githubusercontent.com/MohamedElsiddig/hermes-plugin-factkit/main/update.yaml
 requires_hermes: ">=0.22.7"
+config_schema:
+  embed_api_key:
+    type: string
+    secret: true
+    description: "Bearer token for the embedding endpoint. Read through Hermes' secret scope; never placed in os.environ."
+  embed_base_url:
+    type: string
+    default: "http://127.0.0.1:1234/v1"
+    description: "OpenAI-compatible embeddings endpoint (for example https://llm.local/v1)."
+  embed_model:
+    type: string
+    default: "text-embedding-nomic-embed-text-v1.5"
+    description: "Embedding model name; vectors are stored in factkit's own database, keyed by this model."
+  limit:
+    type: integer
+    default: 3
+    minimum: 1
+    maximum: 50
+    description: "Maximum merged facts returned to a tool call."
+  semantic_weight:
+    type: number
+    default: 0.5
+    minimum: 0
+    maximum: 1
+    description: "Weight of the embedding channel when fusing with the provider's ranking."
+  embed_timeout_ms:
+    type: integer
+    default: 1500
+    description: "Hard deadline for the embedding call in the recall hook."
+  breaker_seconds:
+    type: integer
+    default: 300
+    description: "How long to skip semantic recall after repeated embedding failures."
+  rerank:
+    type: boolean
+    default: false
+    description: "Opt-in re-rank of fused results. Measured inert at the 250 ms budget; leave off."
