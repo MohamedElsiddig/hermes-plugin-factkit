@@ -1,6 +1,6 @@
 # Update feed consumed by `hermes plugins check-updates` / `hermes plugins update`.
 # Bump `version` here in the same commit that bumps `version` in plugin.yaml.
-version: 0.2.1
+version: 0.3.0
 released: 2026-11-06
 artifacts:
   git: https://github.com/MohamedElsiddig/hermes-plugin-factkit.git
