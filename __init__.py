@@ -121,6 +121,23 @@ def _config() -> dict:
     return data
 
 
+def _embed_kwargs() -> dict:
+    """Embedding settings resolved by ``_config()``, passed to holo explicitly.
+
+    Resolved on the calling thread: the secret scope is not safe to touch from
+    the session-end worker.
+    """
+    cfg = _config()
+    out = {}
+    if cfg.get("embed_api_key"):
+        out["embed_api_key"] = str(cfg["embed_api_key"])
+    if cfg.get("embed_base_url"):
+        out["embed_base_url"] = str(cfg["embed_base_url"])
+    if cfg.get("embed_model"):
+        out["embed_model"] = str(cfg["embed_model"])
+    return out
+
+
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     from hermes_constants import get_hermes_home  # type: ignore
@@ -334,7 +351,7 @@ def _resolved_db() -> str | None:
 
 def _open_store(holo, path: str):
     try:
-        return holo.load_plugin_store(path)
+        store = holo.load_plugin_store(path)
     except Exception as exc:  # noqa: BLE001 - the recall path only reads
         # Opening the provider store takes a write lock; inside the gateway's
         # plugin host that can fail with a disk I/O error. Degrade to a
@@ -344,6 +361,11 @@ def _open_store(holo, path: str):
             "store_lock" if ("locked" in text or "disk i/o" in text) else "store_open"
         )
         _record_failure(kind, f"write-open failed ({exc}), using read-only")
+    else:
+        if store is not None:
+            return store
+        _record_failure("store_missing", "store not found, recall disabled")
+        return None
     try:
         return holo.ReadOnlyStore(path)
     except Exception as exc:  # noqa: BLE001 - recall is optional
@@ -526,6 +548,7 @@ def on_pre_llm_call(**kwargs):
             limit=_limit(),
             min_score=_min_score(),
             timeout=_num("embed_timeout_ms", 1500) / 1000.0,
+            **_embed_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001 - recall must never break a turn
         _record_failure("embed_prefetch", f"prefetch skipped ({exc})", embed=True)
@@ -671,6 +694,7 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
             semantic_weight=_num("semantic_weight", 0.5),
             limit=want,
             timeout=_num("embed_timeout_ms", 1500) / 1000.0,
+            **_embed_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001
         _record_failure("embed_merge", f"merge skipped ({exc})", embed=True)
@@ -698,7 +722,7 @@ def _index_timeout() -> float:
         return 10.0
 
 
-def _index_with_timeout(store, timeout: float) -> bool:
+def _index_with_timeout(store, timeout: float, embed: dict | None = None) -> bool:
     """Run ``index_pending`` on a daemon thread; return True if still running.
 
     ``holo.index_pending`` has no timeout argument and its client defaults to a
@@ -714,7 +738,7 @@ def _index_with_timeout(store, timeout: float) -> bool:
         try:
             from .factkit import holo
 
-            outcome["result"] = holo.index_pending(store)
+            outcome["result"] = holo.index_pending(store, **(embed or {}))
         except Exception as exc:  # noqa: BLE001 - indexing is optional
             outcome["error"] = exc
 
@@ -776,8 +800,9 @@ def on_session_end(**kwargs):
             _close_stores()
             return
         running = True
+        embed = _embed_kwargs()
         try:
-            running = _index_with_timeout(store, _index_timeout())
+            running = _index_with_timeout(store, _index_timeout(), embed)
         finally:
             if not running:
                 _close_stores()

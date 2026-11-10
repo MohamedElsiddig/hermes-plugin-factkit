@@ -15,19 +15,18 @@ import contextlib
 import logging
 import re
 import sqlite3
-import sys
-import types
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-try:
-    from hermes_constants import get_hermes_home  # type: ignore
-    _HERMES_HOME = get_hermes_home()
-except Exception:  # pragma: no cover - outside Hermes
-    _HERMES_HOME = Path.home() / ".hermes"
 
-PLUGIN_DIR = _HERMES_HOME / "plugins" / "holographic"
+def _hermes_home() -> Path:
+    """Hermes home, resolved per call (the host may change it at runtime)."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home())
+    except Exception:  # pragma: no cover - outside Hermes
+        return Path.home() / ".hermes"
 
 
 # --------------------------------------------------------------------- store
@@ -287,7 +286,8 @@ class StandaloneStore:
                 from . import entities as entmod
                 names = [(name, "extracted") for name in entmod.candidates(content)
                          if len(str(name).split()) > 1]
-            except Exception:  # noqa: BLE001 - extraction is optional
+            except Exception as exc:  # noqa: BLE001 - extraction is optional
+                logger.debug("factkit: entity extraction unavailable: %s", exc)
                 names = []
         for name, entity_type in names:
             entity_id = self._entity(name, entity_type)
@@ -386,66 +386,36 @@ def _provider_db_path(db_path: str | Path | None = None) -> str:
     """Path of the provider's live store (or the explicit path the caller gave)."""
     if db_path:
         return str(Path(db_path).expanduser())
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore
-        return str(get_hermes_home() / "memory_store.db")
-    except Exception:  # pragma: no cover - outside Hermes
-        return str(_HERMES_HOME / "memory_store.db")
+    return str(_hermes_home() / "memory_store.db")
 
 
 def _factkit_db_path() -> Path:
     """factkit's own writable database, used when no provider is installed."""
-    p = _HERMES_HOME / "plugins" / "factkit" / "facts.db"
+    p = _hermes_home() / "plugins" / "factkit" / "facts.db"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def _ensure_store_file(p: Path) -> "StandaloneStore":
-    """Create the database with a usable schema, not a bare 0-byte file."""
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return StandaloneStore(str(p))
-
-
 def load_plugin_store(db_path: str | Path | None = None):
-    """Return a read-only handle to the provider store.
+    """Read-only handle to the provider store, or None when it does not exist.
 
-    Never imports the provider and never raises at import time: a missing file
-    is bootstrapped with the provider-compatible schema so the read-only probe
-    has a ``facts`` table to read.
+    Never creates the provider database: a missing file means the host has no
+    store yet, so recall is disabled. Never imports the provider.
     """
     path = _provider_db_path(db_path)
     p = Path(path)
     if not p.exists():
-        _ensure_store_file(p).close()
+        logger.debug("factkit: provider store not found at %s; recall disabled", path)
+        return None
     return ReadOnlyStore(path)
 
 
 def _provider_memory_store():
     """The provider's writable ``MemoryStore`` class, or None when unavailable.
 
-    This is the only place allowed to register ``holographic`` in
-    ``sys.modules``; the read-only path never does.
+    A direct import only: the plugin subset never registers a fake
+    ``holographic`` package, so an absent provider simply yields ``None``.
     """
-    # 1) direct import (Hermes gateway)
-    try:
-        from holographic.store import MemoryStore  # type: ignore
-        return MemoryStore
-    except Exception:
-        pass
-    # 2) CLI with the provider plugin installed but not on sys.path
-    try:
-        if "holographic" not in sys.modules and (PLUGIN_DIR / "store.py").exists():
-            pkg = types.ModuleType("holographic")
-            pkg.__path__ = [str(PLUGIN_DIR)]
-            pkg.__package__ = "holographic"
-            sys.modules["holographic"] = pkg
-            try:
-                from . import standalone  # type: ignore
-                standalone.ensure()
-            except Exception:
-                pass
-    except Exception:
-        pass
     try:
         from holographic.store import MemoryStore  # type: ignore
         return MemoryStore
@@ -495,11 +465,7 @@ def _factkit_vectors_db_path() -> Path:
             pass
     except Exception:
         pass
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore
-        base = get_hermes_home() / "plugins" / "factkit"
-    except Exception:
-        base = Path.home() / ".hermes" / "plugins" / "factkit"
+    base = _hermes_home() / "plugins" / "factkit"
     base.mkdir(parents=True, exist_ok=True)
     return base / "facts.db"
 
@@ -528,23 +494,68 @@ def _factkit_vectors_conn(readonly: bool = False):
 
 
 
-def _vectors_conn(store, *, readonly: bool = False):
-    """Connection for fact_embeddings: Store's own DB, else factkit's plugin DB.
+def _is_factkit_store(store) -> bool:
+    """True for ``factkit.store.Store``, without importing the module.
 
-    Only a ``factkit.store.Store`` keeps ``fact_embeddings`` in its own file.
-    Provider handles (``holo.ReadOnlyStore``, the provider's ``MemoryStore``)
-    always use factkit's plugin DB: provider vectors are copied there once by
-    ``_maybe_migrate_vectors`` instead of being read in place.
+    ``Store`` exposes ``.db`` (a connection), ``.readonly`` and ``.path``.
+    Provider handles (``holo.ReadOnlyStore``, ``StandaloneStore``, the
+    provider's ``MemoryStore``) expose ``_conn``/``db_path`` instead, so this
+    duck-typed test never needs ``store.py``, which the plugin subset omits.
     """
-    from .store import Store as FactkitStore
+    if isinstance(store, (ReadOnlyStore, StandaloneStore)):
+        return False
+    try:
+        return (getattr(store, "db", None) is not None
+                and hasattr(store, "readonly")
+                and hasattr(store, "path"))
+    except Exception:
+        return False
 
-    if isinstance(store, FactkitStore):
-        if not getattr(store, "readonly", False):
+
+def _vectors_conn(store, *, readonly: bool = False):
+    """Connection holding ``fact_embeddings``, in precedence order.
+
+    1. Provider handles (``holo.ReadOnlyStore``, ``StandaloneStore``, the
+       provider's ``MemoryStore``) always use factkit's plugin DB: provider
+       vectors are copied there once by ``_maybe_migrate_vectors`` instead of
+       being read in place.
+    2. A handle with a live ``.db`` connection (``factkit.store.Store`` and
+       compatible adapters) keeps ``fact_embeddings`` in its own file, so that
+       connection is used directly; the schema is ensured when writable.
+    3. A legacy duck-typed adapter exposing only ``db_path`` is read from that
+       file read-only, and only when it actually has ``fact_embeddings``.
+    4. Anything else falls back to factkit's plugin DB.
+    """
+    if _is_provider_store(store):
+        conn = _factkit_vectors_conn(readonly=readonly)
+        return conn, True
+
+    db = getattr(store, "db", None)
+    if isinstance(db, sqlite3.Connection):
+        if not readonly and not getattr(store, "readonly", False):
             try:
-                store.db.executescript(_FACTKIT_VECTORS_SCHEMA)
+                db.executescript(_FACTKIT_VECTORS_SCHEMA)
             except Exception:
                 pass
-        return store.db, False
+        return db, False
+
+    db_path = getattr(store, "db_path", None)
+    if db_path:
+        conn = None
+        try:
+            path = Path(db_path).expanduser()
+            if path.exists():
+                conn = sqlite3.connect(
+                    f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("SELECT 1 FROM fact_embeddings LIMIT 1")
+                return conn, True
+        except Exception:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     conn = _factkit_vectors_conn(readonly=readonly)
     return conn, True
@@ -573,11 +584,7 @@ def migrate_vectors_from_provider(provider_db_path: str | Path | None = None) ->
         if provider_db_path:
             provider_path = Path(provider_db_path).expanduser()
         else:
-            try:
-                from hermes_constants import get_hermes_home  # type: ignore
-                provider_path = get_hermes_home() / "memory_store.db"
-            except Exception:
-                provider_path = Path.home() / ".hermes" / "memory_store.db"
+            provider_path = _hermes_home() / "memory_store.db"
         if not provider_path.exists():
             return {"ok": True, "migrated": 0, "reason": "no provider db"}
         try:
@@ -647,9 +654,7 @@ def _maybe_migrate_vectors(store) -> None:
     Best effort: a missing provider, an unreadable file or a concurrent writer
     only logs and leaves recall on the legacy path. Never raises.
     """
-    from .store import Store as FactkitStore
-
-    if isinstance(store, FactkitStore) or not _is_provider_store(store):
+    if _is_factkit_store(store) or not _is_provider_store(store):
         return
     provider = getattr(store, "db_path", None)
     if not provider:
@@ -1129,11 +1134,7 @@ def _query_cache():
         import os
         from .embedcache import EmbedCache
         default_cache = None
-        try:
-            from hermes_constants import get_hermes_home  # type: ignore
-            default_cache = str(get_hermes_home() / "embed_cache.db")
-        except Exception:
-            default_cache = str(Path.home() / ".hermes" / "embed_cache.db")
+        default_cache = str(_hermes_home() / "embed_cache.db")
         path = os.environ.get("FACTKIT_EMBED_CACHE", default_cache)
         try:
             _QUERY_CACHE = EmbedCache(path)
@@ -1142,24 +1143,44 @@ def _query_cache():
     return _QUERY_CACHE or None
 
 
+def _resolve_embed(cfg, *, api_key=None, base_url=None, model=None):
+    """(client, model); the all-None case keeps ``from_config`` for env/defaults."""
+    from .embed import EmbeddingClient, from_config
+
+    if api_key is None and base_url is None and model is None:
+        return from_config(cfg), cfg.embed_model
+    return (
+        EmbeddingClient(
+            base_url=(cfg.embed_base_url if base_url is None else base_url).rstrip("/"),
+            model=cfg.embed_model if model is None else model,
+            api_key=cfg.embed_api_key if api_key is None else api_key,
+            timeout=cfg.embed_timeout,
+            batch_size=cfg.embed_batch,
+        ),
+        (cfg.embed_model if model is None else model),
+    )
+
+
 def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
-             min_score: float = 0.35, timeout: float = 1.5) -> list[dict] | None:
+             min_score: float = 0.35, timeout: float = 1.5,
+             embed_api_key=None, embed_base_url=None,
+             embed_model=None) -> list[dict] | None:
     """Semantic recall for a user message.
 
     Reads facts from the read-only provider store and vectors from factkit's own DB.
     """
     from .config import Config
-    from .embed import from_config
     from .embedcache import cached_embed
 
     _maybe_migrate_vectors(store)
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
-    client = from_config(cfg)
+    client, model = _resolve_embed(cfg, api_key=embed_api_key,
+                                   base_url=embed_base_url, model=embed_model)
     client.timeout, client.retries = timeout, 0
     try:
         qvec = cached_embed(_query_cache(), client.embed_one, message,
-                            str(getattr(cfg, "embed_model", "") or "default"))
+                            str(model or "default"))
     except Exception:  # noqa: BLE001 - endpoint down: caller decides
         return None
     if not qvec:
@@ -1174,7 +1195,6 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
         columns = set()
     entity_column = "f.entities" if "entities" in columns else "NULL"
 
-    model = getattr(cfg, "embed_model", None)
     # Get vectors from factkit's own DB (or the store's own DB for Store)
     vec_rows = {}
     try:
@@ -1259,17 +1279,18 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     return out[:limit]
 
 
-def index_pending(store, *, batch: int = 32, force: bool = False) -> dict:
+def index_pending(store, *, batch: int = 32, force: bool = False,
+                  embed_api_key=None, embed_base_url=None,
+                  embed_model=None) -> dict:
     """Embed facts that have no vector for the configured model (writes to factkit's own DB)."""
     from .config import Config
-    from .embed import from_config
     from .vectors import pack
 
     _maybe_migrate_vectors(store)
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
-    client = from_config(cfg)
-    model = cfg.embed_model
+    client, model = _resolve_embed(cfg, api_key=embed_api_key,
+                                   base_url=embed_base_url, model=embed_model)
     have = set()
     try:
         vconn, vclose = _vectors_conn(store, readonly=False)
@@ -1337,7 +1358,9 @@ def _rrf(rank: int, k: int = 60) -> float:
 
 def fuse_results(store, query: str, provider_facts: list[dict], *,
                  semantic_weight: float = 0.5, limit: int = 10,
-                 min_trust: float = 0.3, timeout: float = 1.5) -> list[dict] | None:
+                 min_trust: float = 0.3, timeout: float = 1.5,
+                 embed_api_key=None, embed_base_url=None,
+                 embed_model=None) -> list[dict] | None:
     """Re-rank provider hits with an embedding channel (RRF), keeping every provider fact.
 
     Returns the merged list, or None when embeddings are unavailable so the caller
@@ -1346,7 +1369,9 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
     # Score the whole embedding channel: within-query margins are ~0.03 between
     # neighbours, so a global similarity floor cannot separate signal from noise.
     hits = prefetch(store, query, limit=1_000_000, min_trust=min_trust,
-                    min_score=0.0, timeout=timeout)
+                    min_score=0.0, timeout=timeout,
+                    embed_api_key=embed_api_key, embed_base_url=embed_base_url,
+                    embed_model=embed_model)
     if hits is None:
         return None
     sem_rank = {h["fact_id"]: i for i, h in enumerate(hits, 1)}
@@ -1481,7 +1506,12 @@ def maintain(store, *, policy=None, dry_run: bool = True, limit: int | None = No
     import datetime as _dt
     import uuid as _uuid
 
-    from . import maintenance, policy as policy_mod, smoke as smoke_mod
+    try:
+        from . import maintenance, policy as policy_mod, smoke as smoke_mod
+    except ImportError as exc:
+        logger.debug("factkit: maintain unavailable in this install: %s", exc)
+        return {"error": "policy/smoke modules are not part of the plugin subset",
+                "skipped": True}
 
     policy = policy or policy_mod.Policy()
     batch_id = batch_id or _dt.datetime.now().strftime("b%Y%m%d%H%M%S") + "-" + _uuid.uuid4().hex[:6]
